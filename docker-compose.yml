@@ -1,4 +1,4 @@
-version: "3.9"
+# docker-compose.yml
 services:
   bot:
     build: .
@@ -7,7 +7,6 @@ services:
     depends_on:
       - db
     restart: unless-stopped
-
   db:
     image: postgres:16-alpine
     environment:
@@ -17,6 +16,5 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
-
 volumes:
   pgdata:

@@ -1,3 +1,4 @@
+# requirements.txt
 aiogram==3.6.0
 asyncpg>=0.29
 SQLAlchemy[asyncio]>=2.0
@@ -6,6 +7,3 @@ python-dotenv>=1.0
 email-validator>=2.0
 ffmpeg-python>=0.2
 pydub>=0.25
-pillow>=9.0
-pytesseract>=0.3
-pydantic-settings>=0.2.0
