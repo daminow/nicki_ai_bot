@@ -1,4 +1,19 @@
-venv/
+# Byte-/cache-stuff
 __pycache__/
+*.py[cod]
+*.sqlite3
+venv/
+
+# Env files
 .env
+.env.*
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# DB volume (если вдруг положите рядом)
 db_data/
+
+# Логи
+logs/
