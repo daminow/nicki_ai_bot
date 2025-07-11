@@ -18,12 +18,13 @@ from typing import List
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.bot import DefaultBotProperties
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup,
+    Message as TgMessage, CallbackQuery as TgCallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup,
     KeyboardButton, BotCommand, Contact
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -32,7 +33,7 @@ from email_validator import validate_email, EmailNotValidError
 from openai import OpenAI
 from pydantic import BaseModel, EmailStr, constr
 from sqlalchemy import (
-    String, Text, DateTime, BigInteger, ForeignKey, func, select, update, delete
+    String, Text, DateTime, BigInteger, ForeignKey, func, select, update, delete,
 )
 from sqlalchemy.ext.asyncio import (
     create_async_engine, async_sessionmaker, AsyncSession
@@ -41,6 +42,7 @@ from sqlalchemy.orm import (
     Mapped, mapped_column, declarative_base, relationship
 )
 from logging.handlers import TimedRotatingFileHandler
+
 
 # --------------------------------------------------------------------------- #
 # ────────────────────────────  CONFIG & LOGGING  ─────────────────────────── #
@@ -115,7 +117,10 @@ class User(Base):
     email_verified: Mapped[bool]   = mapped_column(default=False)
     phone: Mapped[str | None]      = mapped_column(String(32))
     phone_verified: Mapped[bool]   = mapped_column(default=False)
-    created_at: Mapped[DateTime]   = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
     messages: Mapped[List["Message"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
@@ -137,16 +142,33 @@ class Message(Base):
     user_id: Mapped[int]    = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     role: Mapped[str]       = mapped_column(String(16))
     content: Mapped[str]    = mapped_column(Text)
-    created_at: Mapped[DateTime] = mapped_column(DateTime, server_default=func.now())
-    user: Mapped[User]      = relationship(back_populates="messages")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
+    user: Mapped["User"]    = relationship(back_populates="messages")
+
 
 class AdminInvite(Base):
     __tablename__ = "admin_invites"
-    code: Mapped[str]       = mapped_column(primary_key=True)
-    created_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
-    created_at: Mapped[DateTime] = mapped_column(DateTime, default=func.now())
-    expires_at: Mapped[DateTime]
-    used: Mapped[bool]      = mapped_column(default=False)
+    code: Mapped[str] = mapped_column(primary_key=True)
+    created_by: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False
+    )
+    used: Mapped[bool] = mapped_column(default=False)
+
+
+class IssueFSM(StatesGroup):
+    describe = State()
+
 
 # --------------------------------------------------------------------------- #
 # ─────────────────────────────────  AI  ──────────────────────────────────── #
@@ -163,8 +185,10 @@ openai_client = OpenAI(
     api_key=settings.novita_api_key,
 )
 
+
 async def ai_chat(history: list[dict]) -> str:
-    resp = await openai_client.chat.completions.create(
+    # create() is synchronous here, so don’t await it
+    resp = openai_client.chat.completions.create(
         model=settings.novita_model,
         messages=history,
         max_tokens=2048,
@@ -183,37 +207,22 @@ def _gen_code() -> str:
     return str(random.randint(100_000, 999_999))
 
 def send_email_code(address: EmailStr) -> None:
-    """Send 6-digit code."""
     code = _gen_code()
     msg = EmailMessage()
     msg["From"] = settings.smtp_user
     msg["To"] = address
     msg["Subject"] = "Ваш код подтверждения Nicki AI"
-    msg.set_content(
-        f"Код подтверждения: {code}\n\n"
-        f"Если это были не вы, просто проигнорируйте письмо."
-    )
+    msg.set_content(f"Код: {code}\n\nЕсли это были не вы, просто проигнорируйте.")
+
     ctx = ssl.create_default_context()
-    with ssl.create_default_context() as ctx:
-        with ssl.SSLContext().wrap_socket:
-            pass
-    with ssl.create_default_context() as ctx:  # dummy for mypy
-        pass
-    with ssl.create_default_context() as ctx:
-        pass
-    with ssl.create_default_context() as ctx:
-        pass
-    with ssl.create_default_context() as ctx:
-        pass
-    # actual sending:
-    with ssl.create_default_context() as ctx:
-        pass
     import smtplib
     with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, context=ctx) as s:
         s.login(settings.smtp_user, settings.smtp_password)
         s.send_message(msg)
+
     CODE_CACHE[address] = code
     logger.info("Email code %s sent to %s", code, address)
+
 
 def verify_email_code(address: str, code: str) -> bool:
     return CODE_CACHE.get(address) == code.strip()
@@ -248,11 +257,10 @@ class SettingsFSM(StatesGroup):
 def menu_kb(lang: str, is_admin: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="🤕 Текущая проблема", callback_data="issue")
-    builder.button(text="⚙️ Настройки", callback_data="settings")
-    builder.button(text="🗑 Сброс диалога", callback_data="reset")
+    builder.button(text="⚙️ Настройки",         callback_data="settings")
     if is_admin:
         builder.button(text="🛠️ Админ-панель", callback_data="admin")
-    builder.adjust(1)
+    builder.adjust(2)
     return builder.as_markup()
 
 def issue_kb(lang: str) -> InlineKeyboardMarkup:
@@ -267,16 +275,161 @@ def issue_kb(lang: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 def settings_kb(lang: str) -> InlineKeyboardMarkup:
-    ru = ["🌐 Сменить язык", "📧 Сменить e-mail", "📱 Сменить телефон",
-          "📝 Сменить имя", "🗑 Удалить данные", "🏠 Главное меню"]
-    en = ["🌐 Change language", "📧 Change e-mail", "📱 Change phone",
-          "📝 Change name", "🗑 Delete data", "🏠 Home"]
+    ru = [
+        "🌐 Сменить язык",
+        "📧 Сменить e-mail",
+        "📱 Сменить телефон",
+        "📝 Сменить имя",
+        "🗑️ Забыть историю общения",
+        "🏠 Главное меню",
+    ]
+    en = [
+        "🌐 Change language",
+        "📧 Change e-mail",
+        "📱 Change phone",
+        "📝 Change name",
+        "🗑️ Forget chat history",
+        "🏠 Home",
+    ]
     texts = ru if lang == "ru" else en
     builder = InlineKeyboardBuilder()
     for idx, t in enumerate(texts):
-        builder.button(text=t, callback_data=f"set_{idx}")
+        builder.button(text=t, callback_data=f"settings_{idx}")
     builder.adjust(1)
     return builder.as_markup()
+
+
+router = Router()
+# Показать настройки
+@router.callback_query(F.data == "settings")
+async def show_settings(cb: TgCallbackQuery):
+    async with Session() as db:
+        lang = await db.scalar(select(User.language)
+                               .where(User.telegram_id == cb.from_user.id))
+    await cb.message.edit_text("⚙️ Настройки:", reply_markup=settings_kb(lang))
+    await cb.answer()
+
+# Забыть историю общения
+@router.callback_query(F.data == "settings_4")
+async def forget_history(cb: TgCallbackQuery):
+    async with Session() as db:
+        user = await db.scalar(select(User)
+                               .where(User.telegram_id == cb.from_user.id))
+        if user:
+            await db.execute(delete(Message)
+                             .where(Message.user_id == user.id))
+            await db.commit()
+    await cb.answer("🗑️ История общения забыта!", show_alert=True)
+    await cb.message.edit_text("⚙️ Настройки:", reply_markup=settings_kb(user.language))
+
+# Назад в главное меню из настроек
+@router.callback_query(F.data == "settings_5")
+async def settings_to_main(cb: TgCallbackQuery):
+    async with Session() as db:
+        lang     = await db.scalar(select(User.language)
+                                   .where(User.telegram_id == cb.from_user.id))
+        is_admin = await _is_admin(cb.from_user.id, db)
+    await cb.message.edit_text("🏠 Главное меню:", reply_markup=menu_kb(lang, is_admin))
+    await cb.answer()
+
+
+# -----------------------  ГЛАВНОЕ МЕНЮ  -------------------------------
+@router.callback_query(F.data == "issue")
+async def handle_issue(cb: TgCallbackQuery, state: FSMContext):
+    """Переход в состояние описания проблемы."""
+    await cb.message.edit_text("😰 Расскажите, что именно вас беспокоит. Опишите свою ситуацию как можно подробнее:")
+    await state.set_state(IssueFSM.describe)
+    await cb.answer()
+
+
+def followup_kb(lang: str) -> InlineKeyboardMarkup:
+    """Inline keyboard asking if the user has further questions."""
+    yes_text = "👍 Да" if lang == "ru" else "👍 Yes"
+    no_text  = "🏠 В главное меню" if lang == "ru" else "🏠 Main menu"
+    builder = InlineKeyboardBuilder()
+    builder.button(text=yes_text, callback_data="follow_yes")
+    builder.button(text=no_text,  callback_data="follow_no")
+    builder.adjust(2)
+    return builder.as_markup()
+
+@router.message(IssueFSM.describe)
+async def issue_describe(m: TgMessage, state: FSMContext):
+    """Получаем описание проблемы, показываем 'думаю...' и затем отправляем ответ ИИ + вопрос о дальнейших вопросах."""
+    desc = m.text.strip()
+
+    # Сохраняем пользовательское сообщение и готовим историю
+    async with Session() as db:
+        user = await db.scalar(select(User).where(User.telegram_id == m.from_user.id))
+        rows = await db.scalars(
+            select(Message).where(Message.user_id == user.id).order_by(Message.created_at)
+        )
+        history = [{"role": "system",  "content": BASE_PROMPT}]
+        history += [{"role": r.role,   "content": r.content} for r in rows]
+        history.append({"role": "user",  "content": desc})
+
+        db.add(Message(user_id=user.id, role="user", content=desc))
+        await db.commit()
+
+        lang = user.language
+
+    # Пишем «думаю...» перед запросом к ИИ
+    thinking_text = "🤔 Секундочку, подумаю..." if lang == "ru" else "🤔 Just a second, thinking..."
+    thinking = await m.answer(thinking_text)
+
+    # Вызываем ИИ
+    answer = await ai_chat(history)
+
+    # Сохраняем ответ ИИ в БД
+    async with Session() as db:
+        db.add(Message(user_id=user.id, role="assistant", content=answer))
+        await db.commit()
+
+    # Удаляем сообщение «думаю...»
+    await thinking.delete()
+
+    # Отправляем ответ пользователя
+    await m.answer(answer)
+
+    # Спрашиваем, остались ли вопросы (это сообщение удаляется при выборе)
+    prompt = "😇 Остались ли у вас вопросы?" if lang == "ru" else "😇 Any other questions?"
+    await m.answer(prompt, reply_markup=followup_kb(lang))
+
+    await state.clear()
+
+@router.callback_query(F.data == "follow_yes")
+async def follow_yes(cb: TgCallbackQuery, state: FSMContext):
+    """Если пользователь хочет продолжить, возвращаем его в состояние описания."""
+    await cb.message.delete()  # убрать сообщение с кнопками
+    await cb.answer()
+    await cb.message.answer("😰 Опишите, пожалуйста, что вас беспокоит более подробно:")
+    await state.set_state(IssueFSM.describe)
+
+@router.callback_query(F.data == "follow_no")
+async def follow_no(cb: TgCallbackQuery):
+    """Если вопросов больше нет, возвращаем пользователя в главное меню."""
+    async with Session() as db:
+        lang     = await db.scalar(select(User.language).where(User.telegram_id == cb.from_user.id))
+        is_admin = await _is_admin(cb.from_user.id, db)
+
+    await cb.message.delete()  # убрать сообщение с кнопками
+    await cb.answer()
+
+    await cb.message.answer(
+        "👍 Хорошо! Чем ещё могу помочь?" if lang == "ru" else "👍 Great! What else can I help with?",
+        reply_markup=menu_kb(lang, is_admin)
+    )
+
+    
+@router.callback_query(F.data == "home")
+async def handle_home(cb: TgCallbackQuery):
+    async with Session() as db:
+        lang = await db.scalar(select(User.language).where(User.telegram_id == cb.from_user.id))
+        is_admin = await _is_admin(cb.from_user.id, db)
+    await cb.message.edit_text(
+        "👋 Снова привет! Чем могу помочь сегодня?",
+        reply_markup=menu_kb(lang, is_admin)
+    )
+    await cb.answer()
 
 def admin_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -297,7 +450,6 @@ def verify_kb() -> InlineKeyboardMarkup:
 # --------------------------------------------------------------------------- #
 # ────────────────────────────────  ROUTER  ──────────────────────────────── #
 # --------------------------------------------------------------------------- #
-router = Router()
 
 async def _is_admin(tg_id: int, session: AsyncSession) -> bool:
     q = (
@@ -311,52 +463,463 @@ async def _is_admin(tg_id: int, session: AsyncSession) -> bool:
 
 # -----------------------  /start  ---------------------------------------- #
 @router.message(CommandStart())
-async def cmd_start(m: Message, state: FSMContext):
+async def cmd_start(m: TgMessage, state: FSMContext):
     async with Session() as db:
         user = await db.scalar(select(User).where(User.telegram_id == m.from_user.id))
         if user:
-            # Приветствие старого пользователя
             is_admin = await _is_admin(m.from_user.id, db)
             await m.answer(
                 "👋 Снова привет! Чем могу помочь сегодня?",
                 reply_markup=menu_kb(user.language, is_admin)
             )
         else:
-            # Новый пользователь
-            await m.answer(
-                "Привет, я Nicki AI 🦋\n\n"
+            # сохраняем ID приветственного сообщения
+            welcome_msg = await m.answer(
+                "Привет, я Ники 🦋\n\n"
                 "Я умею слушать, задавать вопросы и предлагать техники, "
                 "которые помогают справляться со стрессом, тревогой и унынием. "
-                "Давай познакомимся! Как тебя зовут?",
+                "Давай познакомимся! Как тебя зовут?"
             )
+            await state.update_data(welcome_msg_id=welcome_msg.message_id)
             await state.set_state(Reg.name)
+    # удаляем команду /start пользователя
     await _delete_cmd(m)
 
-# -----------------------  REGISTRATION  ----------------------------------- #
-@router.message(Reg.name, F.text.len() > 1)
-async def reg_name(m: Message, state: FSMContext):
+# -----------------------  REGISTRATION (имя)  ----------------------------- #
+@router.message(Reg.name)
+async def reg_name(m: TgMessage, state: FSMContext):
     name = m.text.strip()
     try:
         _Registration(name=name)
     except Exception:
         await m.answer("Имя должно быть от 2 до 64 символов. Попробуй ещё раз:")
         return
+
+    # удаляем приветственное сообщение бота
+    data = await state.get_data()
+    if "welcome_msg_id" in data:
+        await m.bot.delete_message(chat_id=m.chat.id, message_id=data["welcome_msg_id"])
+
     await state.update_data(name=name)
     await state.set_state(Reg.verify_type)
     await m.answer(
         f"Рада знакомству, {name}! Какой способ подтверждения выберешь?",
         reply_markup=verify_kb()
     )
+    # удаляем сообщение пользователя с именем
     await _delete_cmd(m)
 
-@router.callback_query(Reg.verify_type, F.data == "ver_email")
-async def reg_pick_email(cb: CallbackQuery, state: FSMContext):
+
+# --------------------------------------------------------------------------- #
+#  Выбор способа подтверждения (E-mail)  ----------------------------------- #
+# --------------------------------------------------------------------------- #
+@router.callback_query(F.data == "ver_email")
+async def choose_email_verification(cb: TgCallbackQuery, state: FSMContext):
+    msg = await cb.message.edit_text("📧 Пожалуйста, укажи свой e-mail:")
+    await state.update_data(prompt_msg_id=msg.message_id)
+    await state.set_state(Reg.email)
+    await cb.answer("✉️ Отлично, жду твой e-mail")
+
+
+
+
+
+
+# --------------------------------------------------------------------------- #
+#  Выбор способа подтверждения (Телефон)  ---------------------------------- #
+# --------------------------------------------------------------------------- #
+@router.callback_query(F.data == "ver_phone")
+async def choose_phone_verification(cb: TgCallbackQuery, state: FSMContext):
+    # 1) Удаляем текущее inline-сообщение с кнопками
+    try:
+        await cb.message.delete()
+    except:
+        pass
+
+    # 2) Отправляем новое сообщение с ReplyKeyboardMarkup для контакта
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📲 Поделиться контактом", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    msg = await cb.message.answer(
+        "📲 Пожалуйста, нажми на кнопку, чтобы поделиться своим контактом:",
+        reply_markup=kb
+    )
+    # 3) Сохраняем ID этого сообщения, чтобы потом удалить его
+    await state.update_data(prompt_msg_id=msg.message_id)
+    await state.set_state(Reg.phone)
+    await cb.answer("📞 Жду твой контакт")
+
+# --------------------------------------------------------------------------- #
+#  Обработка ввода E-mail и отправка кода  --------------------------------- #
+# --------------------------------------------------------------------------- #
+@router.message(Reg.email)
+async def reg_email(m: TgMessage, state: FSMContext):
+    data = await state.get_data()
+    # удаляем предыдущее бот-сообщение
+    if "prompt_msg_id" in data:
+        await m.bot.delete_message(chat_id=m.chat.id, message_id=data["prompt_msg_id"])
+
+    # валидация
+    try:
+        email = validate_email(m.text.strip(), check_deliverability=False).email
+    except EmailNotValidError:
+        err = await m.answer("❌ Хмм… это не похоже на настоящий e-mail. Попробуй ещё раз:")
+        await state.update_data(prompt_msg_id=err.message_id)
+        return
+
+    send_email_code(email)
+    await state.update_data(email=email, email_verified=False)
+
+    code_msg = await m.answer("📨 Код отправлен! Введи его здесь:")
+    await state.update_data(prompt_msg_id=code_msg.message_id)
+    await state.set_state(Reg.email_code)
+    await _delete_cmd(m)  # удалим сообщение пользователя с e-mail
+
+
+
+# --------------------------------------------------------------------------- #
+#  Проверка кода из E-mail и завершение регистрации  ------------------------ #
+# --------------------------------------------------------------------------- #
+@router.message(Reg.email_code)
+async def reg_email_code(m: TgMessage, state: FSMContext):
+    data = await state.get_data()
+    if "prompt_msg_id" in data:
+        await m.bot.delete_message(chat_id=m.chat.id, message_id=data["prompt_msg_id"])
+
+    if not verify_email_code(data["email"], m.text):
+        retry = await m.answer("❌ Код не подходит. Попробуй ещё раз:")
+        await state.update_data(prompt_msg_id=retry.message_id)
+        return
+
+    await state.update_data(email_verified=True)
+    await _delete_cmd(m)                # удалим ввод кода
+    await _finish_registration(m, state)
+
+
+# --------------------------------------------------------------------------- #
+#  Завершение регистрации: дружеское введение + главное меню  ----------------
+# --------------------------------------------------------------------------- #
+async def _finish_registration(m: TgMessage, state: FSMContext):
+    data = await state.get_data()
+
+    # 1) Сохраняем пользователя в БД
+    async with Session() as db:
+        user = User(
+            telegram_id   = m.from_user.id,
+            name          = data.get("name", ""),
+            language      = data.get("language", "ru"),
+            email         = data.get("email"),
+            email_verified= data.get("email_verified", False),
+            phone         = data.get("phone"),
+            phone_verified= data.get("phone_verified", False),
+        )
+        db.add(user)
+        role_user = await db.scalar(select(Role).where(Role.name == "user"))
+        if not role_user:
+            role_user = Role(name="user")
+            db.add(role_user)
+            await db.flush()
+        db.add(UserRole(user=user, role=role_user))
+        await db.commit()
+
+    # 2) Дружественное приветствие и объяснение, что это за бот
+    intro = (
+        f"✨ Привет, {data.get('name', 'друг')}! Я Nicki AI 🦋 — твой виртуальный психолог.\n\n"
+        "Я умею:\n"
+        "• Слушать и поддерживать тебя в трудные моменты\n"
+        "• Предлагать техники для снятия стресса и тревоги\n"
+        "• Давать простые практики для улучшения настроения\n\n"
+        "В любой момент можешь выбрать опцию в меню ниже и начать диалог.\n"
+    )
+    await m.answer(intro)
+
+    # 3) Выводим главное меню с кнопками, включая «Настройки»
+    await m.answer(
+        "🏠 Вот что ты можешь сделать прямо сейчас:",
+        reply_markup=menu_kb(user.language, False)
+    )
+
+    # 4) Очищаем состояние FSM
+    await state.clear()
+
+
+# --------------------------------------------------------------------------- #
+#  Обработка отправки контакта и завершение регистрации  -------------------- #
+# --------------------------------------------------------------------------- #
+@router.message(Reg.phone, F.content_type == ContentType.CONTACT)
+async def reg_phone(m: TgMessage, state: FSMContext):
+    data = await state.get_data()
+    # удаляем прошлый prompt
+    if "prompt_msg_id" in data:
+        await m.bot.delete_message(chat_id=m.chat.id, message_id=data["prompt_msg_id"])
+
+    contact: Contact = m.contact
+    if contact.user_id != m.from_user.id:
+        err = await m.answer("❌ Можно поделиться только собственным контактом.")
+        await state.update_data(prompt_msg_id=err.message_id)
+        return
+
+    await state.update_data(phone=contact.phone_number, phone_verified=True)
+    await _delete_cmd(m)   
+    await _finish_registration(m, state)
+
+
+# ───────────────────────── SETTINGS HANDLERS ───────────────────────── #
+
+@router.callback_query(F.data == "settings_0")
+async def change_language(cb: TgCallbackQuery):
+    """Toggle user language between ru and en."""
+    async with Session() as db:
+        user = await db.scalar(select(User).where(User.telegram_id == cb.from_user.id))
+        if not user:
+            return await cb.answer("⚠️ Сначала зарегистрируйтесь.")
+        new_lang = "en" if user.language == "ru" else "ru"
+        await db.execute(
+            update(User)
+            .where(User.id == user.id)
+            .values(language=new_lang)
+        )
+        await db.commit()
+
+    text = "✨ Language switched to English!" if new_lang == "en" else "✨ Язык переключён на русский!"
+    await cb.message.edit_text(text, reply_markup=settings_kb(new_lang))
+    await cb.answer()
+
+
+@router.callback_query(F.data == "settings_1")
+async def change_email_start(cb: TgCallbackQuery, state: FSMContext):
+    """Begin change-email flow."""
+    await cb.message.edit_text("📧 Введите новый e-mail:")
+    await state.set_state(SettingsFSM.new_email)
+    await cb.answer()
+
+
+@router.message(SettingsFSM.new_email)
+async def change_email_receive(m: TgMessage, state: FSMContext):
+    """Validate new email and send confirmation code."""
+    try:
+        email = validate_email(m.text.strip(), check_deliverability=False).email
+    except EmailNotValidError:
+        return await m.answer("❌ Неверный формат. Попробуйте ещё раз:")
+
+    send_email_code(email)
+    await state.update_data(new_email=email)
+    await state.set_state(SettingsFSM.email_code)
+    await m.answer("📨 Код выслан! Введите его для подтверждения:")
+
+
+@router.message(SettingsFSM.email_code)
+async def change_email_confirm(m: TgMessage, state: FSMContext):
+    """Verify the code and update user email."""
+    data = await state.get_data()
+    if not verify_email_code(data["new_email"], m.text):
+        return await m.answer("❌ Код не подходит. Попробуйте ещё раз:")
+
+    async with Session() as db:
+        await db.execute(
+            update(User)
+            .where(User.telegram_id == m.from_user.id)
+            .values(email=data["new_email"], email_verified=True)
+        )
+        await db.commit()
+
+    await m.answer("✅ E-mail обновлён!", reply_markup=settings_kb("ru"))
+    await state.clear()
+
+
+@router.callback_query(F.data == "settings_2")
+async def change_phone_start(cb: TgCallbackQuery, state: FSMContext):
+    """Begin change-phone flow."""
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📲 Поделиться контактом", request_contact=True)]],
+        resize_keyboard=True, one_time_keyboard=True
+    )
+    await cb.message.edit_text("📲 Нажмите, чтобы поделиться контактом:", reply_markup=kb)
+    await state.set_state(SettingsFSM.new_phone)
+    await cb.answer()
+
+
+@router.message(SettingsFSM.new_phone, F.content_type == ContentType.CONTACT)
+async def change_phone_confirm(m: TgMessage, state: FSMContext):
+    """Receive new contact and update it."""
+    contact = m.contact
+    if contact.user_id != m.from_user.id:
+        return await m.answer("❌ Только свой контакт можно отправлять.")
+    async with Session() as db:
+        await db.execute(
+            update(User)
+            .where(User.telegram_id == m.from_user.id)
+            .values(phone=contact.phone_number, phone_verified=True)
+        )
+        await db.commit()
+
+    await m.answer("✅ Телефон обновлён!", reply_markup=settings_kb("ru"))
+    await state.clear()
+
+
+@router.callback_query(F.data == "settings_3")
+async def change_name_start(cb: TgCallbackQuery, state: FSMContext):
+    """Prompt for new display name."""
+    await cb.message.edit_text("📝 Введите новое имя (2–64 символа):")
+    await state.set_state(SettingsFSM.new_name)
+    await cb.answer()
+
+
+@router.message(SettingsFSM.new_name)
+async def change_name_confirm(m: TgMessage, state: FSMContext):
+    """Validate and save new name."""
+    name = m.text.strip()
+    try:
+        _Registration(name=name)
+    except Exception:
+        return await m.answer("❌ Имя должно быть 2–64 символа. Попробуйте ещё раз:")
+
+    async with Session() as db:
+        await db.execute(
+            update(User)
+            .where(User.telegram_id == m.from_user.id)
+            .values(name=name)
+        )
+        await db.commit()
+
+    await m.answer(f"✅ Теперь я буду звать вас «{name}»!", reply_markup=settings_kb("ru"))
+    await state.clear()
+
+
+# ───────────────────────── ADMIN HANDLERS ───────────────────────── #
+
+@router.callback_query(F.data == "a_stats")
+async def admin_stats(cb: TgCallbackQuery):
+    """Show basic user/activity statistics to admins."""
+    if not await _is_admin(cb.from_user.id, Session()):
+        return await cb.answer("🚫 Доступ запрещён.")
+    today = date.today()
+    d1 = datetime.combine(today, datetime.min.time())
+    d7 = d1 - timedelta(days=7)
+    d30 = d1 - timedelta(days=30)
+
+    async with Session() as db:
+        new_day   = await db.scalar(select(func.count()).select_from(User).where(User.created_at >= d1))
+        new_week  = await db.scalar(select(func.count()).select_from(User).where(User.created_at >= d7))
+        new_month = await db.scalar(select(func.count()).select_from(User).where(User.created_at >= d30))
+        act_day   = await db.scalar(select(func.count(func.distinct(Message.user_id))).where(Message.created_at >= d1))
+        act_week  = await db.scalar(select(func.count(func.distinct(Message.user_id))).where(Message.created_at >= d7))
+        act_month = await db.scalar(select(func.count(func.distinct(Message.user_id))).where(Message.created_at >= d30))
+
+    text = (
+        "📊 Статистика:\n"
+        f"Новых пользователей — 24ч: {new_day}, 7д: {new_week}, 30д: {new_month}\n"
+        f"Активных за 24ч: {act_day}, 7д: {act_week}, 30д: {act_month}"
+    )
+    await cb.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "a_add")
+async def admin_add(cb: TgCallbackQuery):
+    """Generate and send a one-time admin invite code."""
+    if not await _is_admin(cb.from_user.id, Session()):
+        return await cb.answer("🚫 Доступ запрещён.")
+    code = str(uuid.uuid4())[:8]
+    expires = datetime.utcnow() + timedelta(hours=6)
+    async with Session() as db:
+        inv = AdminInvite(code=code, created_by=None, expires_at=expires)
+        db.add(inv)
+        await db.commit()
+
+    await cb.message.edit_text(
+        f"🛠️ Скопируйте и отправьте пользователю:\n`/becomeadmin {code}`\n(действует 6 часов)",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=admin_kb()
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "a_del")
+async def admin_del(cb: TgCallbackQuery):
+    """List current admins to remove."""
+    if not await _is_admin(cb.from_user.id, Session()):
+        return await cb.answer("🚫 Доступ запрещён.")
+    async with Session() as db:
+        rows = await db.execute(
+            select(User.id, User.name)
+            .join(UserRole, User.id == UserRole.user_id)
+            .join(Role, Role.id == UserRole.role_id)
+            .where(Role.name == "admin")
+        )
+        admins = rows.all()
+
+    builder = InlineKeyboardBuilder()
+    for uid, name in admins:
+        builder.button(text=name or str(uid), callback_data=f"rem_{uid}")
+    builder.button(text="🏠 Главное меню", callback_data="home")
+    builder.adjust(1)
+    await cb.message.edit_text("➖ Выберите администратора для удаления:", reply_markup=builder.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("rem_"))
+async def remove_admin(cb: TgCallbackQuery):
+    """Remove admin role from selected user."""
+    target_id = int(cb.data.split("_", 1)[1])
+    async with Session() as db:
+        role_admin = await db.scalar(select(Role).where(Role.name == "admin"))
+        await db.execute(
+            delete(UserRole)
+            .where(UserRole.user_id == target_id, UserRole.role_id == role_admin.id)
+        )
+        await db.commit()
+
+    await cb.answer("✅ Роль администратора удалена.", show_alert=True)
+    # refresh admin panel
+    await admin_panel(cb, cb)
+
+
+@router.message(Command("becomeadmin"))
+async def cmd_becomeadmin(m: TgMessage):
+    """User redeems an invite code to become admin."""
+    parts = m.text.strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return await m.answer("⚠️ Используйте: /becomeadmin <код>")
+
+    code = parts[1]
+    async with Session() as db:
+        inv = await db.scalar(
+            select(AdminInvite)
+            .where(
+                AdminInvite.code == code,
+                AdminInvite.expires_at > datetime.utcnow(),
+                AdminInvite.used == False
+            )
+        )
+        user = await db.scalar(select(User).where(User.telegram_id == m.from_user.id))
+
+        if not inv or not user:
+            return await m.answer("⛔️ Неверный или просроченный код, либо вы не зарегистрированы.")
+
+        role_admin = await db.scalar(select(Role).where(Role.name == "admin"))
+        if not role_admin:
+            role_admin = Role(name="admin")
+            db.add(role_admin)
+            await db.flush()
+
+        db.add(UserRole(user_id=user.id, role_id=role_admin.id))
+        inv.used = True
+        await db.commit()
+
+    await m.answer("🎉 Поздравляем! Вы — администратор.", reply_markup=admin_kb())
+    await _delete_cmd(m)
+
+
+@router.callback_query(F.data == "reset")
+async def reset_dialog(cb: TgCallbackQuery):
     await state.set_state(Reg.email)
     await cb.message.edit_text("Укажи свой e-mail:")
     await cb.answer()
 
-@router.callback_query(Reg.verify_type, F.data == "ver_phone")
-async def reg_pick_phone(cb: CallbackQuery, state: FSMContext):
+
     await state.set_state(Reg.phone)
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📲 Поделиться контактом", request_contact=True)]],
@@ -366,8 +929,7 @@ async def reg_pick_phone(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer("Нажми кнопку ниже, чтобы отправить свой контакт 👇", reply_markup=kb)
     await cb.answer()
 
-@router.message(Reg.email, F.text)
-async def reg_email(m: Message, state: FSMContext):
+
     try:
         email = validate_email(m.text.strip(), check_deliverability=False).email
     except EmailNotValidError:
@@ -379,8 +941,6 @@ async def reg_email(m: Message, state: FSMContext):
     await m.answer("Я отправила 6-значный код на твою почту. Введи его здесь:")
     await _delete_cmd(m)
 
-@router.message(Reg.email_code, F.text)
-async def reg_email_code(m: Message, state: FSMContext):
     data = await state.get_data()
     if not verify_email_code(data["email"], m.text):
         await m.answer("Код не подходит. Попробуй снова:")
@@ -389,8 +949,6 @@ async def reg_email_code(m: Message, state: FSMContext):
     # Финал регистрации
     await _finish_registration(m, state)
 
-@router.message(Reg.phone, F.contact)
-async def reg_phone_contact(m: Message, state: FSMContext):
     contact: Contact = m.contact
     if contact.user_id != m.from_user.id:
         await m.answer("Можно поделиться только собственным контактом 💡")
@@ -401,7 +959,6 @@ async def reg_phone_contact(m: Message, state: FSMContext):
     # убрать reply-клаву
     await m.answer("👍 Готово!", reply_markup=types.ReplyKeyboardRemove())
 
-async def _finish_registration(m: Message, state: FSMContext):
     data = await state.get_data()
     async with Session() as db:
         user = User(
@@ -431,8 +988,6 @@ async def _finish_registration(m: Message, state: FSMContext):
     await _delete_cmd(m)
 
 # -----------------------  ISSUES  ---------------------------------------- #
-@router.callback_query(F.data == "issue")
-async def cb_issue_root(cb: CallbackQuery):
     async with Session() as db:
         lang = await db.scalar(
             select(User.language).where(User.telegram_id == cb.from_user.id)
@@ -440,8 +995,6 @@ async def cb_issue_root(cb: CallbackQuery):
     await cb.message.edit_text("Выбери, что беспокоит:", reply_markup=issue_kb(lang))
     await cb.answer()
 
-@router.callback_query(F.data.startswith("issue_"))
-async def cb_issue_selected(cb: CallbackQuery):
     cat = int(cb.data.split("_")[1])
     prompts_ru = ["Я чувствую тревогу", "Я испытываю стресс",
                   "Мне грустно", "У меня проблемы в отношениях"]
@@ -471,8 +1024,6 @@ async def cb_issue_selected(cb: CallbackQuery):
     await cb.answer()
 
 # -----------------------  SETTINGS  -------------------------------------- #
-@router.callback_query(F.data == "settings")
-async def cb_settings(cb: CallbackQuery, state: FSMContext):
     async with Session() as db:
         lang = await db.scalar(
             select(User.language).where(User.telegram_id == cb.from_user.id)
@@ -481,8 +1032,6 @@ async def cb_settings(cb: CallbackQuery, state: FSMContext):
     await state.set_state(SettingsFSM.awaiting)
     await cb.answer()
 
-@router.callback_query(SettingsFSM.awaiting, F.data == "set_0")  # language
-async def set_lang(cb: CallbackQuery, state: FSMContext):
     async with Session() as db:
         user = await db.scalar(select(User).where(User.telegram_id == cb.from_user.id))
         new_lang = "en" if user.language == "ru" else "ru"
@@ -496,14 +1045,10 @@ async def set_lang(cb: CallbackQuery, state: FSMContext):
     )
     await cb.answer()
 
-@router.callback_query(SettingsFSM.awaiting, F.data == "set_1")  # change email
-async def set_email(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("Введи новый e-mail:")
     await state.set_state(SettingsFSM.new_email)
     await cb.answer()
 
-@router.message(SettingsFSM.new_email, F.text)
-async def process_new_email(m: Message, state: FSMContext):
     try:
         email = validate_email(m.text.strip(), check_deliverability=False).email
     except EmailNotValidError:
@@ -515,8 +1060,6 @@ async def process_new_email(m: Message, state: FSMContext):
     await m.answer("Код отправлен! Введи его сюда:")
     await _delete_cmd(m)
 
-@router.message(SettingsFSM.email_code, F.text)
-async def process_email_code(m: Message, state: FSMContext):
     data = await state.get_data()
     if not verify_email_code(data["new_email"], m.text):
         await m.answer("Код не совпадает. Попробуй ещё:")
@@ -532,8 +1075,6 @@ async def process_email_code(m: Message, state: FSMContext):
     await state.set_state(SettingsFSM.awaiting)
     await _delete_cmd(m)
 
-@router.callback_query(SettingsFSM.awaiting, F.data == "set_2")  # change phone
-async def set_phone(cb: CallbackQuery, state: FSMContext):
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📲 Поделиться контактом", request_contact=True)]],
         resize_keyboard=True,
@@ -543,8 +1084,6 @@ async def set_phone(cb: CallbackQuery, state: FSMContext):
     await state.set_state(SettingsFSM.new_phone)
     await cb.answer()
 
-@router.message(SettingsFSM.new_phone, F.contact)
-async def process_new_phone(m: Message, state: FSMContext):
     phone = m.contact.phone_number
     async with Session() as db:
         await db.execute(
@@ -556,14 +1095,10 @@ async def process_new_phone(m: Message, state: FSMContext):
     await m.answer("📱 Телефон обновлён!", reply_markup=settings_kb("ru"))
     await state.set_state(SettingsFSM.awaiting)
 
-@router.callback_query(SettingsFSM.awaiting, F.data == "set_3")  # change name
-async def set_name(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("Как мне теперь к тебе обращаться?")
     await state.set_state(SettingsFSM.new_name)
     await cb.answer()
 
-@router.message(SettingsFSM.new_name, F.text)
-async def process_new_name(m: Message, state: FSMContext):
     name = m.text.strip()
     try:
         _Registration(name=name)
@@ -581,8 +1116,6 @@ async def process_new_name(m: Message, state: FSMContext):
     await state.set_state(SettingsFSM.awaiting)
     await _delete_cmd(m)
 
-@router.callback_query(SettingsFSM.awaiting, F.data == "set_4")  # delete data
-async def delete_all_data(cb: CallbackQuery, state: FSMContext):
     async with Session() as db:
         user = await db.scalar(select(User).where(User.telegram_id == cb.from_user.id))
         await db.execute(delete(Message).where(Message.user_id == user.id))
@@ -596,8 +1129,6 @@ async def delete_all_data(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.answer()
 
-@router.callback_query(F.data == "home")
-async def cb_home(cb: CallbackQuery):
     async with Session() as db:
         user = await db.scalar(select(User).where(User.telegram_id == cb.from_user.id))
         is_admin = await _is_admin(cb.from_user.id, db)
@@ -605,7 +1136,6 @@ async def cb_home(cb: CallbackQuery):
     await cb.answer()
 
 # -----------------------  RESET  ----------------------------------------- #
-@router.callback_query(F.data == "reset")
 @router.message(Command("reset"))
 async def reset_dialog(ev: Message | CallbackQuery):
     if isinstance(ev, Message):
@@ -644,8 +1174,6 @@ async def admin_panel(ev: Message | CallbackQuery):
     if isinstance(ev, Message):
         await _delete_cmd(ev)
 
-@router.callback_query(F.data == "a_stats")
-async def admin_stats(cb: CallbackQuery):
     async with Session() as db:
         today = date.today()
         d1 = datetime.combine(today, datetime.min.time())
@@ -677,8 +1205,6 @@ async def admin_stats(cb: CallbackQuery):
     await cb.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_kb())
     await cb.answer()
 
-@router.callback_query(F.data == "a_add")
-async def admin_add(cb: CallbackQuery):
     code = str(uuid.uuid4())[:8]
     expires = datetime.utcnow() + timedelta(hours=6)
     async with Session() as db:
@@ -694,8 +1220,6 @@ async def admin_add(cb: CallbackQuery):
     )
     await cb.answer()
 
-@router.message(Command("becomeadmin"))
-async def cmd_become_admin(m: Message):
     parts = m.text.strip().split(maxsplit=1)
     if len(parts) != 2:
         await m.answer("⚠️ Формат: /becomeadmin <код>")
@@ -730,7 +1254,7 @@ async def cmd_become_admin(m: Message):
 # --------------------------------------------------------------------------- #
 # ─────────────────────────────  UTILITIES  ──────────────────────────────── #
 # --------------------------------------------------------------------------- #
-async def _delete_cmd(msg: Message):
+async def _delete_cmd(msg: TgMessage):
     """Попытаться удалить команду пользователя для чистоты чата."""
     try:
         await msg.delete()
@@ -743,26 +1267,31 @@ async def _delete_cmd(msg: Message):
 async def on_startup(bot: Bot):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # ensure roles
         for role_name in ("user", "admin"):
-            await conn.execute(
-                Role.__table__.insert()
-                .values(name=role_name)
-                .on_conflict_do_nothing(index_elements=["name"])
-            )
+            stmt = pg_insert(Role.__table__).values(name=role_name)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["name"])
+            await conn.execute(stmt)
+
     me = await bot.get_me()
     logger.info("Nicki AI started as @%s", me.username)
-    # set bot commands
+
     cmds = [
-        BotCommand(command="start", description="Перезапустить бота 🏁"),
-        BotCommand(command="issue", description="Открыть список проблем 🤕"),
+        BotCommand(command="start",    description="Перезапустить бота 🏁"),
+        BotCommand(command="issue",    description="Открыть список проблем 🤕"),
         BotCommand(command="settings", description="Настройки ⚙️"),
-        BotCommand(command="reset", description="Сброс диалога 🗑"),
-        BotCommand(command="admin", description="Админ-панель 🛠️"),
+        BotCommand(command="reset",    description="Сброс диалога 🗑"),
+        BotCommand(command="admin",    description="Админ-панель 🛠️"),
     ]
     await bot.set_my_commands(cmds)
 
+# --- bot.py ---
+
+async def prepare_db() -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
 async def main() -> None:
+    await prepare_db()          
     defaults = DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
     bot = Bot(settings.bot_token, default=defaults)
     dp = Dispatcher()
